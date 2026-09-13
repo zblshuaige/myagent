@@ -381,7 +381,7 @@ func (a *Agent) ChatSessionStream(ctx context.Context, session *Session, userMes
 	return msg, nil
 }
 
-// trimSessionByTokens 基于 token 预算裁剪会话历史，超出时触发摘要压缩
+// trimSessionByTokens 基于 token 预算裁剪会话历史，超出时触发滚动摘要压缩
 func (a *Agent) trimSessionByTokens(ctx context.Context, session *Session) {
 	maxTokens := session.MaxTokens
 	if maxTokens <= 0 {
@@ -393,7 +393,7 @@ func (a *Agent) trimSessionByTokens(ctx context.Context, session *Session) {
 		return
 	}
 
-	logger.Infof("[session=%s] token 超预算 (%d > %d)，执行摘要压缩", session.ID, tokens, maxTokens)
+	logger.Infof("[session=%s] token 超预算 (%d > %d)，执行滚动摘要压缩", session.ID, tokens, maxTokens)
 
 	history := session.GetHistory()
 	if len(history) <= 3 {
@@ -401,7 +401,7 @@ func (a *Agent) trimSessionByTokens(ctx context.Context, session *Session) {
 	}
 
 	// 保留 system prompt (history[0]) 和最近的 N 条消息
-	// 对中间的旧消息进行摘要
+	// 对中间的旧消息进行滚动摘要
 	keepRecent := len(history) / 3 // 保留最近 1/3 的消息
 	if keepRecent < 4 {
 		keepRecent = 4
@@ -413,10 +413,12 @@ func (a *Agent) trimSessionByTokens(ctx context.Context, session *Session) {
 	oldMessages := history[1 : len(history)-keepRecent]
 	recentMessages := history[len(history)-keepRecent:]
 
-	// 用 LLM 生成摘要
-	summary := a.summarizeMessages(ctx, oldMessages)
+	// 滚动摘要：旧摘要 + 中间消息 -> 增量合成新摘要，摘要永不丢失
+	prevSummary := session.GetSummary()
+	summary := a.summarizeMessages(ctx, prevSummary, oldMessages)
+	session.SetSummary(summary)
 
-	// 重建历史：system prompt + 摘要消息 + 最近消息
+	// 重建历史：system prompt + 摘要消息 + 最近消息（始终只保留一条摘要）
 	newHistory := make([]model.Message, 0, keepRecent+2)
 	newHistory = append(newHistory, history[0]) // system prompt
 	newHistory = append(newHistory, model.Message{
@@ -426,13 +428,21 @@ func (a *Agent) trimSessionByTokens(ctx context.Context, session *Session) {
 	newHistory = append(newHistory, recentMessages...)
 
 	session.SetHistory(newHistory)
-	logger.Infof("[session=%s] 摘要压缩完成: %d -> %d 条消息", session.ID, len(history), len(newHistory))
+	logger.Infof("[session=%s] 滚动摘要压缩完成: %d -> %d 条消息, 摘要长度=%d",
+		session.ID, len(history), len(newHistory), len(summary))
 }
 
-// summarizeMessages 用 LLM 生成历史消息摘要
-func (a *Agent) summarizeMessages(ctx context.Context, messages []model.Message) string {
+// summarizeMessages 用 LLM 生成历史消息摘要（滚动式：旧摘要 + 新消息 -> 增量合成新摘要）
+func (a *Agent) summarizeMessages(ctx context.Context, prevSummary string, messages []model.Message) string {
 	// 构建摘要请求
 	var sb strings.Builder
+
+	if prevSummary != "" {
+		sb.WriteString("【已有对话摘要】\n")
+		sb.WriteString(prevSummary)
+		sb.WriteString("\n\n【本次新增的对话内容】\n")
+	}
+
 	for _, msg := range messages {
 		if msg.Role == "tool" {
 			sb.WriteString(fmt.Sprintf("[工具返回]: %s\n", truncate(msg.Content, 100)))
@@ -444,25 +454,35 @@ func (a *Agent) summarizeMessages(ctx context.Context, messages []model.Message)
 	}
 
 	summarizePrompt := []model.Message{
-		{Role: "system", Content: "请将以下对话历史压缩为简洁的摘要，保留关键信息和上下文。摘要应该让AI能理解之前讨论过的内容。用中文回答，不超过300字。"},
+		{Role: "system", Content: "请将对话历史压缩为简洁的摘要，保留关键信息和上下文。" +
+			"如果提供了【已有对话摘要】，请在其基础上合并本次新增的对话内容，生成一份完整的更新后摘要，不要遗漏之前的关键信息。" +
+			"摘要应该让AI能理解之前讨论过的内容。用中文回答，不超过300字。"},
 		{Role: "user", Content: sb.String()},
 	}
 
 	resp, err := a.llm.Chat(ctx, summarizePrompt, nil)
 	if err != nil {
 		logger.Errorf("生成摘要失败: %v", err)
-		// fallback：简单截取
+		// fallback：有旧摘要则直接沿用，否则简单截取
+		if prevSummary != "" {
+			return prevSummary
+		}
 		return truncate(sb.String(), 300)
 	}
 	if len(resp.Choices) > 0 {
 		return resp.Choices[0].Message.Content
+	}
+	if prevSummary != "" {
+		return prevSummary
 	}
 	return truncate(sb.String(), 300)
 }
 
 // mergeToolCalls 合并流式返回的 tool call 增量
 // OpenAI 兼容协议中，流式 tool_calls 按 index 分片到达：
-//   首个分片携带 id/type/name，后续分片只携带 index + arguments 片段（id/type/name 为空）。
+//
+//	首个分片携带 id/type/name，后续分片只携带 index + arguments 片段（id/type/name 为空）。
+//
 // 因此必须按 index 匹配增量，而不能按 id 匹配（否则后续分片会被当成新的独立 tool call）。
 func mergeToolCalls(existing []model.ToolCall, deltas []model.ToolCall) []model.ToolCall {
 	for _, d := range deltas {

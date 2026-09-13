@@ -16,7 +16,8 @@ type Session struct {
 	SystemPrompt string
 	CreatedAt    time.Time
 	LastActiveAt time.Time
-	MaxTokens    int // token 预算上限（0 表示使用默认值）
+	MaxTokens    int    // token 预算上限（0 表示使用默认值）
+	Summary      string // 滚动摘要（方案 A）：历史压缩后累积的增量摘要，始终只保留一条
 }
 
 // NewSession 创建新会话
@@ -60,13 +61,28 @@ func (s *Session) SetHistory(history []model.Message) {
 	s.LastActiveAt = time.Now()
 }
 
-// Clear 清空历史，仅保留 system prompt
+// GetSummary 获取滚动摘要（线程安全）
+func (s *Session) GetSummary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Summary
+}
+
+// SetSummary 设置滚动摘要（线程安全）
+func (s *Session) SetSummary(summary string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Summary = summary
+}
+
+// Clear 清空历史与滚动摘要，仅保留 system prompt
 func (s *Session) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.History = []model.Message{
 		{Role: "system", Content: s.SystemPrompt},
 	}
+	s.Summary = ""
 	s.LastActiveAt = time.Now()
 }
 
@@ -102,66 +118,66 @@ func estimateStringTokens(s string) int {
 }
 
 // SessionManager 管理多个会话
+//
+// 基于 sync.Map 实现：读多写少、key（sessionID）互不相交的场景下，
+// 读路径完全无锁（Load 走 read 快照 + CAS），写路径仅在新增 key 时加锁。
+// 每个 WebSocket 连接只读写自己的 session，天然符合 sync.Map 的适用场景。
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
+	sessions sync.Map // key: sessionID, value: *Session
 }
 
 // NewSessionManager 创建会话管理器
 func NewSessionManager() *SessionManager {
-	return &SessionManager{
-		sessions: make(map[string]*Session),
-	}
+	return &SessionManager{}
 }
 
-// Get 获取会话
+// Get 获取会话（无锁读路径）
 func (sm *SessionManager) Get(sessionID string) (*Session, bool) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	s, ok := sm.sessions[sessionID]
-	return s, ok
+	v, ok := sm.sessions.Load(sessionID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*Session), true
 }
 
 // Create 创建会话
 func (sm *SessionManager) Create(id, agentID, systemPrompt string, maxTokens int) *Session {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	s := NewSession(id, agentID, systemPrompt, maxTokens)
-	sm.sessions[id] = s
+	sm.sessions.Store(id, s)
 	return s
 }
 
 // Delete 删除会话
 func (sm *SessionManager) Delete(sessionID string) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	delete(sm.sessions, sessionID)
+	sm.sessions.Delete(sessionID)
 }
 
 // ListByAgent 列出指定 agent 的所有会话
+// 注意：Range 遍历不保证一致性快照，回调内不得修改 map（先收集后处理）
 func (sm *SessionManager) ListByAgent(agentID string) []*Session {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
 	var result []*Session
-	for _, s := range sm.sessions {
-		if s.AgentID == agentID {
+	sm.sessions.Range(func(_, v interface{}) bool {
+		if s, ok := v.(*Session); ok && s.AgentID == agentID {
 			result = append(result, s)
 		}
-	}
+		return true
+	})
 	return result
 }
 
 // CleanExpired 清理过期会话（超过 maxAge 未活跃的会话）
+// 先收集过期的 sessionID，再统一删除，避免在 Range 回调内修改 map
 func (sm *SessionManager) CleanExpired(maxAge time.Duration) int {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
-	count := 0
-	for id, s := range sm.sessions {
-		if s.LastActiveAt.Before(cutoff) {
-			delete(sm.sessions, id)
-			count++
+	var expired []string
+	sm.sessions.Range(func(key, v interface{}) bool {
+		if s, ok := v.(*Session); ok && s.LastActiveAt.Before(cutoff) {
+			expired = append(expired, key.(string))
 		}
+		return true
+	})
+	for _, id := range expired {
+		sm.sessions.Delete(id)
 	}
-	return count
+	return len(expired)
 }
